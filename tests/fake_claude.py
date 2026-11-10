@@ -1,9 +1,11 @@
-"""A stand-in for `claude -p` that plays each solaudit stage deterministically.
+"""A stand-in for `claude -p`, or for `codex exec`, that plays each solaudit stage deterministically.
 
 It reads the stage from the system prompt, acts on the fixture project the way a session
-would (writing probing tests into its worktree), and prints a result object shaped like the
-real one. Every invocation is appended to $FAKE_CLAUDE_LOG for the tests to inspect.
-FAKE_SCENARIO selects alternative behavior: `auth`, `spoil`, `degrade`, `hunt-error`.
+would (writing probing tests into its worktree), and prints a result shaped like the real
+harness's: Claude Code's JSON result object, or Codex's JSONL events. Invoked as `codex sandbox`
+it plays the sandbox check. Every invocation is appended to $FAKE_CLAUDE_LOG for the tests to
+inspect. FAKE_SCENARIO selects alternative behavior: `auth`, `spoil`, `degrade`, `hunt-error`,
+`limit`, `sandbox-leak`.
 """
 
 import json
@@ -11,22 +13,58 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 ARGS = sys.argv[1:]
 SCENARIO = os.environ.get("FAKE_SCENARIO", "default")
+CODEX = bool(ARGS) and ARGS[0] in ("exec", "sandbox")
+# Codex's options come before `--`, and the prompt or sandboxed command after it.
+OPTIONS, TAIL = (ARGS[1:ARGS.index("--")], ARGS[ARGS.index("--") + 1:]) if CODEX else (ARGS, [])
+CONFIG = {}  # Codex's `-c key=value` overrides
+for i, arg in enumerate(OPTIONS):
+    if CODEX and arg == "-c":
+        key, _, value = OPTIONS[i + 1].partition("=")
+        CONFIG[key] = tomllib.loads(f"v = {value}")["v"]  # an override that is not TOML is a solaudit bug
 
 
 def opt(name, default=None):
-    return ARGS[ARGS.index(name) + 1] if name in ARGS else default
+    return OPTIONS[OPTIONS.index(name) + 1] if name in OPTIONS else default
 
 
-PROMPT = opt("-p", "")
-SYSTEM = opt("--append-system-prompt", "")
+if ARGS == ["--version"]:
+    print(f"codex-cli {os.environ.get('FAKE_CODEX_VERSION', '0.167.0')}")
+    sys.exit(0)
+
+
+def sandbox_check():
+    """Play `codex sandbox` running solaudit's check: a working sandbox writes its worktree."""
+    inside = Path(opt("--cd"))
+    (inside / "written").touch()
+    print("SOLAUDIT-WRITE-OK")
+    if SCENARIO == "sandbox-leak":
+        print("SOLAUDIT-READ-LEAK")
+    path = os.environ.get("FAKE_CLAUDE_LOG")
+    if path:
+        with open(path, "a") as f:
+            f.write(json.dumps({"stage": "preflight", "flags": OPTIONS, "config": CONFIG, "command": TAIL}) + "\n")
+    sys.exit(0)
+
+
+if CODEX and ARGS[0] == "sandbox":
+    sandbox_check()
+if CODEX:
+    os.chdir(opt("--cd"))
+    PROMPT = TAIL[0]
+    SYSTEM = CONFIG.get("developer_instructions", "")
+else:
+    PROMPT = opt("-p", "")
+    SYSTEM = opt("--append-system-prompt", "")
 MODEL = opt("--model", "")
 CAP = float(opt("--max-budget-usd", "100"))
 STAGE = re.search(r"solaudit stage: (\w+)", SYSTEM).group(1)
 COST = min(0.5, CAP)
+TOKENS = 500_000  # what a Codex session reports using
 
 CHEATS = '''interface Vm {
     function prank(address) external;
@@ -109,23 +147,44 @@ def log_invocation():
     path = os.environ.get("FAKE_CLAUDE_LOG")
     if not path:
         return
-    skip = {"-p", "--append-system-prompt", "--json-schema"}
+    skip = {"-p", "--append-system-prompt", "--json-schema", "-c"}
     flags = []
     i = 0
-    while i < len(ARGS):
-        if ARGS[i] in skip:
+    while i < len(OPTIONS):
+        if OPTIONS[i] in skip:
             i += 2
             continue
-        flags.append(ARGS[i])
+        flags.append(OPTIONS[i])
         i += 1
-    record = {"stage": STAGE, "cwd": os.getcwd(), "flags": flags, "prompt": PROMPT, "system": SYSTEM,
+    config = {k: v for k, v in CONFIG.items() if k != "developer_instructions"}
+    schema = json.loads(Path(opt("--output-schema")).read_text()) if CODEX else None
+    record = {"stage": STAGE, "cwd": os.getcwd(), "flags": flags, "config": config, "schema": schema,
+              "prompt": PROMPT, "system": SYSTEM,
               "stdin_tty": os.isatty(0), "env_keys": sorted(os.environ),
               "files": sorted(str(f.relative_to(Path.cwd())) for f in Path.cwd().glob("src/*.sol"))}
     with open(path, "a") as f:
         f.write(json.dumps(record) + "\n")
 
 
+def finish_codex(output, error=None, result_text=None):
+    events = [{"type": "thread.started", "thread_id": "fake"}, {"type": "turn.started"}]
+    if error:
+        message = result_text or error
+        events += [{"type": "error", "message": message}, {"type": "turn.failed", "error": {"message": message}}]
+    else:
+        events += [
+            {"type": "item.completed", "item": {"id": "item_0", "type": "agent_message", "text": json.dumps(output)}},
+            {"type": "turn.completed", "usage": {"input_tokens": TOKENS * 4 // 5, "cached_input_tokens": 0,
+                                                 "output_tokens": TOKENS // 5, "reasoning_output_tokens": 0}},
+        ]
+    for event in events:
+        print(json.dumps(event))
+    sys.exit(1 if error else 0)
+
+
 def finish(output, error=None, result_text=None):
+    if CODEX:
+        finish_codex(output, error, result_text)
     models = [MODEL]
     stops = 0
     if SCENARIO == "degrade" and STAGE == "validate":
@@ -169,7 +228,8 @@ def candidate(lens, title, category, function, line, test=None, contract="Vault"
 
 
 def hunt():
-    write(".claude/.cc-writes/record", "what Claude Code itself writes in a session's directory\n")
+    if not CODEX:
+        write(".claude/.cc-writes/record", "what Claude Code itself writes in a session's directory\n")
     if SCENARIO == "hunt-error":
         finish(None, error="error_during_execution", result_text="boom")
     match = re.search(r"one lens only: `([\w-]+)`", PROMPT)
@@ -226,7 +286,8 @@ def hunt():
         assert data("undiscussed entry points") is not None, "the gap hunter needs the undiscussed entry points"
         assert data("other candidates") is not None, "the gap hunter needs the other candidates"
         out.append(candidate("gap", "setFee has no access control", "access-control", "setFee(uint256)", 24))
-    assert re.search(r"spending cap of \$\d+\.\d\d", SYSTEM), "the hunter is told its spending cap"
+    cap = r"[\d,]+ tokens" if CODEX else r"\$\d+\.\d\d"
+    assert re.search(r"spending cap of " + cap, SYSTEM), "the hunter is told its spending cap in its harness's unit"
     explored = [
         {"hypothesis": c["title"], "contract": c["contract"], "function": c["function"],
          "test": (c["test"] or {}).get("file", ""), "outcome": "candidate"}
@@ -269,5 +330,10 @@ def prove():
 log_invocation()
 if SCENARIO == "auth" or (SCENARIO == "auth-later" and STAGE == "validate") \
         or (SCENARIO == "auth-prove" and STAGE == "prove"):
-    finish(None, error="error_during_execution", result_text="Not logged in · Please run /login")
+    finish(None, error="error_during_execution", result_text=(
+        "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header" if CODEX
+        else "Not logged in · Please run /login"
+    ))
+if SCENARIO == "limit" and STAGE == "validate":
+    finish(None, error="error_during_execution", result_text="You've hit your usage limit. Try again later.")
 {"hunt": hunt, "merge": merge, "validate": validate, "prove": prove}[STAGE]()

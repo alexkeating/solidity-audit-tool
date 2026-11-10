@@ -13,14 +13,13 @@ from pathlib import Path, PurePosixPath
 from . import baseline as baseline_mod
 from . import foundry, prompts, report, scope as scope_mod, slither
 from .lenses import GAP, LENS_NAMES, LENSES
-from .sessions import (
-    READING_TOOLS, TESTING_TOOLS, Budget, Runner, Session, read_rules, testing_rules, testing_settings,
-)
+from .sessions import Access, Budget, Runner, Session
 from .util import (
-    EXIT_OK, GIT_SAFE, SolauditError, begin_cleanup, fingerprint, git, log, reset_stopping, now, plural, public, runs_home, stopping, write_json,
-    write_text,
+    EXIT_OK, GIT_SAFE, SECRET_NAME, SolauditError, begin_cleanup, fingerprint, git, log, reset_stopping, now, plural, public, runs_home, stopping, write_json,
+    without_secrets, write_text,
 )
 from .worktree import Worktree, remove_all
+from .harness import harness_for
 
 CONTEXT_LIMIT = 30_000
 SIGNALS_LIMIT = 30_000
@@ -36,7 +35,6 @@ CHECK_ENV = (
     "SSL_CERT_FILE", "SSL_CERT_DIR", "NIX_SSL_CERT_FILE",
     "LD_LIBRARY_PATH", "NIX_LD", "NIX_LD_LIBRARY_PATH",  # what a downloaded solc may need to start
 )
-SECRET_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|MNEMONIC|PRIVATE|ETHERSCAN|RPC|URL", re.I)
 # Failure reasons that mean a test reached for a network it was not given.
 NETWORK_FAILURE = re.compile(r"could not instantiate forked environment|failed to retrieve chain ID|"
                              r"error sending request|dns error|Connection refused|network is unreachable", re.I)
@@ -186,8 +184,12 @@ class Scan:
         self.src = foundry.project_dir(project.root, config["src"] or project.foundry["src"])
         if self.src.startswith(".."):
             raise SolauditError(f"unsupported configuration: src {self.src} is outside the project")
-        total = options.get("budget") or config["budget"]["quick_usd" if self.profile == "quick" else "deep_usd"]
-        self.budget = Budget(float(total), float(config["budget"]["session_usd"]))
+        self.harness = options.get("harness_impl") or harness_for(options.get("harness") or config["harness"])
+        unit = self.harness.unit
+        total = options.get("budget") or config["budget"][f"{self.profile}_{unit}"]
+        self.budget = Budget(float(total), float(config["budget"][f"session_{unit}"]), self.harness.minimum)
+        # A stage with no model configured uses the harness's default (None: the harness's own choice).
+        self.models = {stage: model or self.harness.default_model for stage, model in config["model"].items()}
         rpc_endpoints = project.foundry["rpc_endpoints"]
         self.rpc_env = foundry.rpc_variables(project.root, rpc_endpoints) if config["allow_fork"] else {}
         self.fork_hosts = foundry.rpc_hosts(rpc_endpoints, self.rpc_env) if config["allow_fork"] else []
@@ -240,8 +242,9 @@ class Scan:
             return EXIT_OK, self.empty_report()
         self.run_id, self.run_dir = new_run_dir()
         log(f"run {self.run_id}: {plural(len(in_scope), 'file')} in scope, {self.profile} profile")
-        self.runner = Runner(self.run_dir, self.budget)
+        self.runner = Runner(self.run_dir, self.budget, self.harness)
         try:
+            self.harness.preflight(self.run_dir / "preflight")
             write_json(self.run_dir / "scope.json", {
                 "mode": self.mode, "base": self.base, "src": self.src, "changed": changed, "files": in_scope,
             })
@@ -279,7 +282,9 @@ class Scan:
             "head": self.project.head(),
             "profile": self.profile,
             "partial": partial,
-            "cost_usd": round(self.budget.spent, 4),
+            "harness": self.harness.name,
+            "cost_usd": round(self.budget.spent, 4) if self.harness.unit == "usd" else None,
+            "usage_tokens": int(self.budget.spent) if self.harness.unit == "tokens" else None,
             "analyzers": self.analyzers,
             "counts": counts,
             "stale_baseline": stale,
@@ -398,11 +403,19 @@ class Scan:
         """The testing tool set for a Hunt or Prove session in a worktree: its tools, its
         pre-approvals, its sandbox, and its environment."""
         return {
-            "tools": TESTING_TOOLS,
-            "allowed": testing_rules(worktree.root, self.project.probe_dir, self.project.root, *self.readable()),
-            "settings": testing_settings(worktree.root, self.fork_hosts, [self.project.top], writable=worktree.path),
+            "access": Access(
+                "test", read=(self.project.root, *self.readable()), worktree=worktree.root,
+                writable=worktree.path, probe_dir=self.project.probe_dir, protected=[self.project.top],
+                fork_hosts=self.fork_hosts, build_read=self.build_read(),
+            ),
             "env": self.session_env(),
         }
+
+    def build_read(self):
+        """What forge reads to build besides the worktree: the repository (libraries above a
+        project in a monorepo) and each library directory, wherever it is."""
+        libs = [(self.project.root / lib).resolve() for lib in self.project.foundry["libs"]]
+        return [self.project.top, *[lib for lib in libs if lib.exists()]]
 
     def readable(self):
         """What sessions may read in the run directory besides their own worktree."""
@@ -468,13 +481,11 @@ class Scan:
         if session is not None:
             if session.sandbox_error:
                 raise SolauditError(
-                    f"missing tool: the Claude Code sandbox is unavailable ({session.sandbox_error}); "
-                    "install bubblewrap and socat, or run with --no-tests"
+                    f"missing tool: the {self.harness.title} sandbox is unavailable ({session.sandbox_error}); "
+                    f"{self.harness.sandbox_hint}"
                 )
             if session.auth_failed:
-                raise SolauditError(
-                    "not authenticated: log in to Claude Code (run `claude` and use /login) or set ANTHROPIC_API_KEY"
-                )
+                raise SolauditError(f"not authenticated: {self.harness.auth_hint}")
 
     def entry_points_not_mentioned(self, prior, prior_explored=()):
         """Entry points no earlier candidate is about and no earlier hunter explored."""
@@ -522,15 +533,15 @@ class Scan:
             prompt.data("undiscussed entry points",
                         "\n".join(self.entry_points_not_mentioned(prior, prior_explored)) or "(none)")
         system = prompts.hunt_system(prompt.tag, lens_names, test_dir, self.fork_hosts, self.testing,
-                                     self.budget.per_session)
+                                     self.harness.amount(self.budget.per_session), self.harness.name)
         schema = prompts.candidate_schema(lens_names)
         worktree, problem = None, None
         if self.testing and not (self.budget.reached or stopping() or self.runner.fatal):
             worktree, problem = self.try_worktree(f"hunt-{name}")
         if not self.testing:
             session = self.runner.run(
-                "hunt", name, prompt.render(), system, schema, self.config["model"]["hunt"], self.project.root,
-                tools=READING_TOOLS, allowed=read_rules(self.project.root, *self.readable()),
+                "hunt", name, prompt.render(), system, schema, self.models["hunt"], self.project.root,
+                access=Access("read", read=(self.project.root, *self.readable())),
             )
         elif worktree is None:
             session = Session("hunt", name)
@@ -541,7 +552,7 @@ class Scan:
             )
         else:
             session = self.runner.run(
-                "hunt", name, prompt.render(), system, schema, self.config["model"]["hunt"], worktree.root,
+                "hunt", name, prompt.render(), system, schema, self.models["hunt"], worktree.root,
                 **self.testing_session(worktree),
             )
         result = {"session": session, "candidates": [], "explored": []}
@@ -565,7 +576,8 @@ class Scan:
                 "hypotheses": len(explored),
                 "tested": sum(1 for e in explored if e["test"]),
                 "candidates": len(candidates),
-                "cost_usd": round(session.cost, 4),
+                "cost_usd": round(session.cost, 4) if self.harness.unit == "usd" else None,
+                "usage_tokens": int(session.cost) if self.harness.unit == "tokens" else None,
             }
         if worktree and any(c["test"] for c in candidates):
             spoiled = self.prepare_check(worktree)
@@ -634,14 +646,9 @@ class Scan:
 
     def session_env(self):
         """The environment of a testing session, whose forge runs can read any variable: the tool's
-        own, less secrets (Claude Code's own credentials stay, for it to authenticate), plus the
+        own, less secrets (the harness's own credentials stay, for it to authenticate), plus the
         RPC endpoints' variables when fork tests are allowed."""
-        auth = ["ANTHROPIC_", "CLAUDE_"]
-        if os.environ.get("CLAUDE_CODE_USE_BEDROCK"):
-            auth.append("AWS_")
-        if os.environ.get("CLAUDE_CODE_USE_VERTEX"):
-            auth += ["GOOGLE_", "CLOUD_ML_", "VERTEX_"]
-        env = {k: v for k, v in os.environ.items() if k.startswith(tuple(auth)) or not SECRET_NAME.search(k)}
+        env = without_secrets(os.environ, self.harness.auth_prefixes())
         env.update(self.rpc_env)
         env["FOUNDRY_FFI"] = "false"
         return env
@@ -802,7 +809,7 @@ class Scan:
             return findings
         session = self.runner.run(
             "merge", "", rendered, prompts.merge_system(prompt.tag), prompts.MERGE_SCHEMA,
-            self.config["model"]["validate"], self.run_dir, tools=(),
+            self.models["validate"], self.run_dir,
         )
         self.check_fatal()
         if not session.ok:
@@ -857,9 +864,9 @@ class Scan:
             prompt.text("The candidate has no test that fails. Judge it on the code alone, against the first four gates.")
         session = self.runner.run(
             "validate", finding["fingerprint"], prompt.render(), prompts.validate_system(prompt.tag),
-            prompts.VALIDATE_SCHEMA, self.config["model"]["validate"], self.project.root,
+            prompts.VALIDATE_SCHEMA, self.models["validate"], self.project.root,
             # Only the signals attached to the finding, which its prompt carries; not signals.json.
-            tools=READING_TOOLS, allowed=read_rules(self.project.root, self.run_dir / "facts"),
+            access=Access("read", read=(self.project.root, self.run_dir / "facts")),
         )
         if session.not_started or session.hit_total_cap:
             return False  # listed as not validated before the cap, not as a settled finding
@@ -931,8 +938,9 @@ class Scan:
 
     def prove_in(self, finding, worktree, prompt, test_dir):
         session = self.runner.run(
-            "prove", finding["fingerprint"], prompt.render(), prompts.prove_system(prompt.tag, test_dir, self.fork_hosts),
-            prompts.PROVE_SCHEMA, self.config["model"]["prove"], worktree.root,
+            "prove", finding["fingerprint"], prompt.render(),
+            prompts.prove_system(prompt.tag, test_dir, self.fork_hosts, self.harness.name),
+            prompts.PROVE_SCHEMA, self.models["prove"], worktree.root,
             **self.testing_session(worktree),
         )
         if session.not_started or session.over_cap:

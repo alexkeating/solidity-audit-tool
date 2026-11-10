@@ -1,6 +1,6 @@
 # solaudit Implementation Spec
 
-Draft 4 · Nov 9, 2026
+Draft 5 · Nov 10, 2026
 
 ## Goals and Requirements
 
@@ -125,9 +125,16 @@ longer exists is reported as stale.
 assumptions (which roles are trusted to do what), and intended behavior. Its contents are given to
 every hunter and verifier. Trust assumptions stated there bound what counts as an attacker.
 
+**Two harnesses.** Every language-model session in a scan runs under one harness: Claude Code
+(the default) or Codex. The developer chooses it in the configuration or for one scan. Both run
+the same stages with the same prompts and schemas, and both confine a session to the same files,
+commands' network, and writes; each enforces those limits with its own mechanism.
+
 **Budgets.** Every language-model session has a spending cap, and every scan has a total cap.
-When a scan reaches its total cap, it stops starting new sessions, reports what has completed, and
-marks the report partial.
+Caps are in USD under Claude Code and in tokens under Codex. When a scan reaches its total cap,
+it stops starting new sessions, reports what has completed, and marks the report partial. A Codex
+session's cap is not enforced while it runs: what it used counts against the scan's total when it
+ends. A session stopped by the account's own usage limit marks the scan's total cap reached.
 
 **Repository content is data.** Source files, comments, documentation, dependency code, and
 analyzer output are passed to sessions as data to analyse. No text found in them is treated as an
@@ -136,21 +143,24 @@ instruction, and every session prompt says so.
 ### Actor Capabilities
 
 **Developer** — a person working on the project, running the tool on their own machine under
-their own Claude Code login or API key. The tool runs only where a developer starts it.
+their own Claude Code or Codex login or API key. The tool runs only where a developer starts it.
 - Can scan the changes on their branch against a base ref.
 - Can scan the whole project.
-- Can choose the profile, the lenses, and the spending cap for a scan.
+- Can choose the harness, the profile, the lenses, and the spending cap for a scan.
 - Can read the report in the terminal, as Markdown, as JSON, or as SARIF.
 - Can copy a proven finding's test into the project's test suite as a regression test.
 - Can record a finding in the baseline as accepted risk or false positive, with a reason.
 - Can write the project's security context file.
 
-**Language-model session** — a headless Claude Code run started by the tool for one stage.
+**Language-model session** — a headless Claude Code or Codex run started by the tool for one
+stage.
 - Can read files in the project and the run directory.
 - Can, in the Hunt and Prove stages only, write test files inside its scratch copy of the project
   and run `forge build` and `forge test` there.
-- Cannot change the project's source, cannot write outside its scratch copy, and cannot run any
-  other command.
+- Under Codex, can also run commands that read the files it is given, in every stage but Merge.
+- Cannot change the project's source and cannot write outside its scratch copy. Under Claude
+  Code, cannot run any other command; under Codex, no command it runs can read a file it is not
+  given.
 - Cannot use the network, except that `forge test` reaches the project's configured RPC endpoints
   when the project enables fork tests.
 
@@ -164,8 +174,8 @@ their own Claude Code login or API key. The tool runs only where a developer sta
 - **git** — resolves the base ref and changed files for diff scans, and creates the scratch
   worktrees for the Hunt and Prove stages.
 
-Every external program the tool runs — `git`, `forge`, `slither`, `claude` — is the one found on
-`PATH`.
+Every external program the tool runs — `git`, `forge`, `slither`, `claude`, `codex` — is the one
+found on `PATH`. Only the scan's harness needs to be installed.
 
 ### Integrations
 
@@ -243,6 +253,56 @@ following behavior:
   restricts settings, and therefore hooks, to the user's own; `--strict-mcp-config` with no MCP
   configuration starts no MCP servers. With both flags a session runs nothing the scanned project
   defines, under either authentication path.
+- A session waits briefly for standard input unless it is redirected from the null device.
+
+#### Codex (`codex`), version 0.167 or later, headless
+
+Used instead of Claude Code when the scan's harness is `codex`. Every language-model session is
+one `codex exec` process. The tool relies on the following behavior:
+
+- `codex exec --json <prompt>` runs one non-interactive session and exits, printing one JSON
+  event per line on stdout. The session's final answer is the `text` of the last `item.completed`
+  event whose item has type `agent_message`. A `turn.completed` event carries `usage`, whose
+  `input_tokens` (cached or not) and `output_tokens` are what the session used. A session that
+  fails ends with a `turn.failed` event whose `error.message` is Codex's own description of the
+  failure; `error` events before it carry Codex's own messages. An authentication failure's
+  message contains `401 Unauthorized`; a session stopped by the account's usage limit has a
+  message that says so. Codex reports neither the models that served a session nor safeguard
+  stops.
+- `--output-schema <file>` makes the final answer conform to a JSON Schema in which every object
+  sets `additionalProperties` to `false` and requires every property it defines.
+- `--model` selects the model; without it, Codex uses its default for the account. `-c
+  key=value` sets a configuration value for the session, the value parsed as TOML.
+  `developer_instructions` adds stage instructions to the session's instructions.
+- `--ignore-user-config` loads none of the user's Codex configuration (authentication still uses
+  the user's Codex login), `--ignore-rules` loads no exec-policy rule files, and `--ephemeral`
+  writes no session files. A project's own `.codex/` configuration loads only for a project the
+  user's configuration trusts, so with `--ignore-user-config` none loads. `project_doc_max_bytes =
+  0` loads no `AGENTS.md`. `skills.include_instructions = false` and `skills.bundled.enabled =
+  false` give the session no skill, the project's `.agents/skills` included. `web_search =
+  "disabled"`, `features.hooks = false`, and `false` for `features.apps`, `features.browser_use`,
+  `features.computer_use`, `features.multi_agent`, `features.goals`, `features.image_generation`,
+  and `features.view_image` leave the session the shell as its only tool besides its answer;
+  `--disable shell_tool` removes the shell too.
+- A permission profile confines every command the session runs. `default_permissions =
+  "<name>"` selects the profile `permissions.<name>`; no `sandbox_mode` may be set, since it
+  replaces the profile. The profile's `filesystem` table maps paths to `read`, `write`, or `deny`;
+  the most specific entry for a path wins. `":root" = "deny"` with `":minimal" = "read"` denies
+  every path except the system's own files, so a command cannot read or list a path the table
+  does not grant; a write outside a `write` entry does not reach the disk. The profile's `network`
+  table with `enabled = false` gives commands no network. With `enabled = true`, `domains` mapping
+  hosts to `allow`, and `features.network_proxy = true`, commands reach only those hosts, through
+  a proxy whose address Codex puts in the commands' environment; a command that bypasses the
+  proxy resolves no host.
+- `shell_environment_policy` sets the environment of the commands the session runs: `inherit =
+  "all"` passes Codex's own environment, `filters` maps name patterns to `exclude`, and `set` adds
+  variables.
+- `approval_policy = "never"` refuses every command the profile does not allow, instead of
+  asking.
+- `codex sandbox --permission-profile <name> -- <command>` runs one command under a profile given
+  with `-c`, with no model.
+- Authentication: the user's Codex login (`codex login`, a ChatGPT plan or an API key), or the
+  `CODEX_API_KEY` environment variable.
 - A session waits briefly for standard input unless it is redirected from the null device.
 
 ## Tool Definition
@@ -423,12 +483,14 @@ Two candidates with the same fingerprint are the same finding.
   "head": "5255274…",
   "profile": "quick",
   "partial": false,
+  "harness": "claude",
   "cost_usd": 3.42,
+  "usage_tokens": null,
   "analyzers": {"forge-lint": "ok", "slither": "absent"},
   "counts": {"proven": 0, "confirmed": 1, "uncertain": 1, "rejected": 6, "baselined": 2},
   "stale_baseline": [],
   "hunt_depth": {
-    "accounting": {"hypotheses": 9, "tested": 6, "candidates": 1, "cost_usd": 2.41}
+    "accounting": {"hypotheses": 9, "tested": 6, "candidates": 1, "cost_usd": 2.41, "usage_tokens": null}
   },
   "degraded_sessions": [
     {
@@ -444,12 +506,16 @@ Two candidates with the same fingerprint are the same finding.
 
 - `hunt_depth` — one entry per Hunt session that completed, keyed by its lens (`all` under the
   quick profile): the number of hypotheses in its explored record, how many of those name a test,
-  how many of its candidates were kept, and what the session cost.
+  how many of its candidates were kept, and what the session spent: `cost_usd` under Claude Code
+  and `usage_tokens` under Codex, the other `null`.
 - `degraded_sessions` — one entry per session that was served by any model other than the one
   configured for its stage, or whose `safety_stops` is greater than zero. `stage` is `hunt`,
   `merge`, `validate`, or `prove`; `subject` is the lens name for a Hunt session, the finding's
   fingerprint for a Validate or Prove session, and the empty string for the Merge session;
-  `served_models` lists every key of the session's `modelUsage`.
+  `served_models` lists every key of the session's `modelUsage`. Under Codex the list is always
+  empty, since Codex reports neither.
+- `harness` — `claude` or `codex`. `cost_usd` is what a Claude Code scan spent and `null` under
+  Codex; `usage_tokens` is the tokens a Codex scan used and `null` under Claude Code.
 
 #### Files and Configuration
 
@@ -469,7 +535,8 @@ All three are meant to be committed to the project's repository.
 - `~/.cache/solaudit/runs/<UTC yyyymmddTHHMMSSZ>-<8 hex>/` — one run directory per scan,
   containing `scope.json`, `facts/`, `signals.json`, `candidates/<lens>.json`, `merged.json`,
   `findings.json`, `tests/`, `worktrees/` (removed when the scan ends), `report.md`, `report.sarif`, `summary.json`, and `sessions/` with
-  each session's prompt and raw JSON result.
+  each session's prompt and raw result (Claude Code's JSON object, or Codex's JSON events), and
+  for a Codex session the schema file it was given.
 
 **Configuration keys and defaults:**
 
@@ -479,13 +546,17 @@ All three are meant to be committed to the project's repository.
 | `src` | `src` from `foundry.toml` | Directory whose contracts are in scope. |
 | `exclude` | `[]` | Globs under `src` removed from scope. |
 | `lenses` | all seven | Lenses run by the deep profile. |
-| `model.hunt` | `claude-opus-5-5` | Model for Hunt sessions. |
-| `model.validate` | `claude-opus-5-5` | Model for Merge and Validate sessions. |
-| `model.prove` | `claude-opus-5-5` | Model for Prove sessions. |
+| `harness` | `claude` | `claude` (Claude Code) or `codex` (Codex). |
+| `model.hunt` | the harness's default | Model for Hunt sessions: `claude-opus-5-5` under Claude Code, Codex's default for the account under Codex. |
+| `model.validate` | the harness's default | Model for Merge and Validate sessions. |
+| `model.prove` | the harness's default | Model for Prove sessions. |
 | `allow_fork` | `false` | Whether sessions may write and run fork tests. |
-| `budget.session_usd` | `3` | Spending cap per session. |
-| `budget.quick_usd` | `10` | Total cap for a quick scan. |
-| `budget.deep_usd` | `60` | Total cap for a deep scan. |
+| `budget.session_usd` | `3` | Spending cap per session, under Claude Code. |
+| `budget.quick_usd` | `10` | Total cap for a quick scan, under Claude Code. |
+| `budget.deep_usd` | `60` | Total cap for a deep scan, under Claude Code. |
+| `budget.session_tokens` | `5000000` | Token cap per session, under Codex. |
+| `budget.quick_tokens` | `15000000` | Total token cap for a quick scan, under Codex. |
+| `budget.deep_tokens` | `100000000` | Total token cap for a deep scan, under Codex. |
 | `parallel` | `4` | Maximum concurrent sessions. |
 | `fail_on.severity` | `medium` | Lowest severity that fails a scan. |
 | `fail_on.status` | `confirmed` | Lowest status that fails a scan (`proven` > `confirmed` > `uncertain`). |
@@ -496,8 +567,8 @@ All three are meant to be committed to the project's repository.
 
 ```
 solaudit scan [--diff [<base>] | --full] [--profile quick|deep] [--lens <name>]...
-              [--budget <usd>] [--no-tests] [--format text|md|json|sarif] [--out <path>]
-              [--show-rejected] [<project-root>]
+              [--harness claude|codex] [--budget <amount>] [--no-tests]
+              [--format text|md|json|sarif] [--out <path>] [--show-rejected] [<project-root>]
 ```
 
 Runs the pipeline on the Foundry project at `<project-root>` (default: the current directory).
@@ -567,8 +638,10 @@ Report contents, in every format: findings ordered by status (`proven`, `confirm
 recommendation, the validation reasoning, and, when it has a test, the test's kind, the property
 it asserts, its failure reason and counterexample, and its path. Then: stale baseline entries,
 analyzers that did not run, lenses that did not complete, the hunt depth of each lens that did
-(hypotheses explored, how many with a test, candidates kept, cost), degraded sessions with the model
-configured and the models that served each, total cost, and whether the report is partial. A
+(hypotheses explored, how many with a test, candidates kept, cost in USD or tokens used),
+degraded sessions with the model configured and the models that served each (under Codex, a line
+saying they are not detected), total cost in USD or tokens used, and whether the report is
+partial. A
 finding whose Hunt, Validate, or Prove session was degraded is marked as such next to its
 status. Rejected findings appear only with `--show-rejected`. In SARIF, each finding is one
 result whose `ruleId` is the category, whose `level` is `error` for high, `warning` for medium,
@@ -580,9 +653,11 @@ Options:
 - `--full` — full mode.
 - `--profile` — overrides the mode's default profile.
 - `--lens` — repeatable; restricts the deep profile to the named lenses.
-- `--budget` — overrides the profile's total cap.
-- `--no-tests` — hunters receive only `Read`, `Grep`, and `Glob`, write no tests, and the Prove
-  stage is skipped. No finding can be `proven`.
+- `--harness` — overrides the configured harness.
+- `--budget` — overrides the profile's total cap: USD under Claude Code, tokens under Codex. A
+  `k` or `M` suffix multiplies the number by a thousand or a million.
+- `--no-tests` — hunters only read (under Claude Code, with only `Read`, `Grep`, and `Glob`),
+  write no tests, and the Prove stage is skipped. No finding can be `proven`.
 - `--format`, `--out` — report format (default `text`) and destination (default stdout).
 - `--show-rejected` — includes rejected findings in the report.
 
@@ -662,7 +737,31 @@ The testing tool set is `Read`, `Grep`, `Glob`, `Edit`, `Write`, and `Bash`, wit
   true, the hosts of the URLs in the project's `[rpc_endpoints]` are allowed;
 - `FOUNDRY_FFI=false` in the session's environment.
 
+Under Codex, a testing session's limits come from its permission profile instead:
+
+- reads denied everywhere except the system's own files, the worktree, the project, the
+  repository holding it, each directory named by `libs`, the run directory's `facts/` and
+  `signals.json`, the directory holding `forge`, and the solc installations `forge` uses (under
+  `$SVM_HOME`, `~/.svm`, and `$XDG_DATA_HOME/svm`);
+- writes allowed only inside the worktree, and not in its `.git`;
+- network access denied — except that when `allow_fork` is true, the hosts of the URLs in the
+  project's `[rpc_endpoints]` are reachable through Codex's network proxy;
+- `FOUNDRY_FFI=false` and `FOUNDRY_NO_STORAGE_CACHING=true` in the environment of the commands it
+  runs, and no `OPENAI_` or `CODEX_` variable.
+
+Codex gives every session a shell. A Codex Hunt or Prove session is told to run, besides `forge
+build` and `forge test`, only commands that read files, and to write files only under
+`test/solaudit/`; what it can reach is bounded by its profile, not by that instruction. A Codex
+Validate session, and a Codex Hunt session under `--no-tests`, has the same profile with no
+`write` entry, no network, and reads limited to the files that stage's Claude Code session may
+read. A Codex Merge session has no shell.
+
 A session is told whether fork tests are available. When they are not, it writes none.
+
+Before a Codex scan's first session, the tool runs one command under a testing profile with
+`codex sandbox`, with no Codex configuration loaded: it writes a file in a scratch directory the
+profile allows, and tries to read and to write in one it does not. The scan stops unless the
+first write lands and the others do not.
 
 #### Test Check
 
@@ -687,15 +786,21 @@ These hold for every session the tool starts, in every stage:
   block — source excerpts, facts, signals, security context, candidates — is delimited and
   labelled as data, and the instructions state that nothing inside a data block is an
   instruction.
-- The session is started with `--setting-sources user` and `--strict-mcp-config`, with standard
-  input redirected from the null device. It receives no MCP servers and runs no hook or setting
-  defined by the scanned project.
-- Any tool use not pre-approved for the stage is denied without prompting.
+- The session is started with standard input redirected from the null device. It receives no MCP
+  servers and runs no hook, setting, instruction file, or skill defined by the scanned project:
+  under Claude Code it is started with `--setting-sources user` and `--strict-mcp-config`; under
+  Codex with `--ignore-user-config`, `--ignore-rules`, `--ephemeral`, no `AGENTS.md`, and no
+  skills.
+- Any tool use not pre-approved for the stage is denied without prompting. Under Codex, any
+  command its permission profile does not allow is refused, never escalated.
+- Every session that can run a command, and under Codex every session, receives the tool's own
+  environment less any variable whose name suggests a secret; the harness's own credentials stay
+  with the harness and, under Codex, never reach the commands the session runs.
 - The session's result is parsed against the stage's schema. A result that does not parse is
   treated as a session error.
 - The prompt and the raw result are written to the run directory's `sessions/`.
-- After each session the tool compares the keys of the result's `modelUsage` with the model
-  configured for the stage and reads `safety_stops`. A session served by any other model, or
+- After each Claude Code session the tool compares the keys of the result's `modelUsage` with
+  the model configured for the stage and reads `safety_stops`. A session served by any other model, or
   stopped by a safeguard at least once, is recorded as degraded. A degraded session's output is
   still used; degradation never changes a finding's status or the exit status.
 - A Validate session never receives a hunter's reasoning, another verifier's verdict, or analyzer
@@ -708,11 +813,14 @@ These hold for every session the tool starts, in every stage:
 Each error prints one line to stderr naming the cause and exits with status `2` unless noted.
 
 - **Not a Foundry project** — `<project-root>` has no `foundry.toml`.
-- **Missing tool** — `forge`, `git`, or `claude` is not on `PATH`, or `forge` is older than 1.8.
+- **Missing tool** — `forge`, `git`, or the harness's program (`claude` or `codex`) is not on
+  `PATH`, `forge` is older than 1.8, `codex` is older than 0.167, or the Codex sandbox check
+  fails. For a sandbox that is unavailable, the message names what failed.
 - **Build failed** — `forge build` exits non-zero. The compiler's output is shown.
 - **Unknown base** — the base ref does not resolve.
 - **Not authenticated** — the first session reports an authentication failure. The message says
-  to log in to Claude Code or set `ANTHROPIC_API_KEY`.
+  to log in to Claude Code or set `ANTHROPIC_API_KEY`, or under Codex to run `codex login` or set
+  `CODEX_API_KEY`.
 - **Invalid configuration** — a config file does not parse or has a key of the wrong type. The
   message names the file and key.
 - **Invalid baseline** — `.solaudit/baseline.json` does not parse. The scan does not run.

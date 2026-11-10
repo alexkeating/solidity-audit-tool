@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -53,6 +54,15 @@ def log(message):
     """Progress goes to stderr so that stdout carries only the report."""
     with _log_lock:
         print(f"solaudit: {message}", file=sys.stderr, flush=True)
+
+
+# Names of environment variables that may hold a secret.
+SECRET_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|MNEMONIC|PRIVATE|ETHERSCAN|RPC|URL", re.I)
+
+
+def without_secrets(env, keep=()):
+    """The variables of `env` whose names do not suggest a secret, plus those starting with `keep`."""
+    return {k: v for k, v in env.items() if k.startswith(tuple(keep)) or not SECRET_NAME.search(k)}
 
 
 def sh(cmd, cwd=None, env=None, check=True, timeout=None, stdin=subprocess.DEVNULL):

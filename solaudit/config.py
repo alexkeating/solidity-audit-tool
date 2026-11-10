@@ -11,15 +11,21 @@ from .util import SolauditError, config_home
 SEVERITIES = ["high", "medium", "low", "info"]
 STATUSES = ["proven", "confirmed", "uncertain", "rejected"]
 FAIL_STATUSES = ["proven", "confirmed", "uncertain"]
+HARNESSES = ["claude", "codex"]
 
 DEFAULTS = {
     "base": None,  # the remote's default branch, resolved at scan time
     "src": None,  # `src` from foundry.toml, resolved at scan time
     "exclude": [],
     "lenses": list(LENS_NAMES),
-    "model": {"hunt": "claude-opus-5-5", "validate": "claude-opus-5-5", "prove": "claude-opus-5-5"},
+    "harness": "claude",
+    # None: the harness's default (claude-opus-5-5 under Claude Code, Codex's own under Codex).
+    "model": {"hunt": None, "validate": None, "prove": None},
     "allow_fork": False,
-    "budget": {"session_usd": 3.0, "quick_usd": 10.0, "deep_usd": 60.0},
+    "budget": {
+        "session_usd": 3.0, "quick_usd": 10.0, "deep_usd": 60.0,  # Claude Code
+        "session_tokens": 5_000_000, "quick_tokens": 15_000_000, "deep_tokens": 100_000_000,  # Codex
+    },
     "parallel": 4,
     "fail_on": {"severity": "medium", "status": "confirmed"},
 }
@@ -41,6 +47,10 @@ def _usd(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
 
 
+def _tokens(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
 def _count(value):
     return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
@@ -51,6 +61,7 @@ CHECKS = {
     "src": (_string, "a non-empty string"),
     "exclude": (_strings, "an array of strings"),
     "lenses": (_lenses, f"a non-empty array of lens names ({', '.join(LENS_NAMES)})"),
+    "harness": (lambda v: v in HARNESSES, f"one of {', '.join(HARNESSES)}"),
     "model.hunt": (_string, "a non-empty string"),
     "model.validate": (_string, "a non-empty string"),
     "model.prove": (_string, "a non-empty string"),
@@ -58,6 +69,9 @@ CHECKS = {
     "budget.session_usd": (_usd, "a positive number"),
     "budget.quick_usd": (_usd, "a positive number"),
     "budget.deep_usd": (_usd, "a positive number"),
+    "budget.session_tokens": (_tokens, "a positive integer"),
+    "budget.quick_tokens": (_tokens, "a positive integer"),
+    "budget.deep_tokens": (_tokens, "a positive integer"),
     "parallel": (_count, "a positive integer"),
     "fail_on.severity": (lambda v: v in SEVERITIES, f"one of {', '.join(SEVERITIES)}"),
     "fail_on.status": (lambda v: v in FAIL_STATUSES, f"one of {', '.join(FAIL_STATUSES)}"),

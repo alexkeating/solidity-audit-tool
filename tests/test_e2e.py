@@ -1,4 +1,4 @@
-"""End-to-end scans of a fixture Foundry project, with real forge and git and a fake claude."""
+"""End-to-end scans of a fixture Foundry project, with real forge and git and a fake claude or codex."""
 
 import json
 import os
@@ -27,6 +27,8 @@ def git(cwd, *args):
 @unittest.skipUnless(shutil.which("forge") and shutil.which("git"), "needs forge and git")
 class ScanTest(unittest.TestCase):
     """Each test gets a fresh copy of a git repository holding the fixture project."""
+
+    harness = "claude"
 
     @classmethod
     def setUpClass(cls):
@@ -87,10 +89,17 @@ class ScanTest(unittest.TestCase):
     def summary(self):
         return json.loads((self.run_dir() / "summary.json").read_text())
 
-    def sessions(self):
+    def records(self):
         if not self.log.exists():
             return []
         return [json.loads(line) for line in self.log.read_text().splitlines()]
+
+    def sessions(self):
+        return [r for r in self.records() if r["stage"] != "preflight"]
+
+    def preflights(self):
+        """The sandbox checks a Codex scan ran before its sessions."""
+        return [r for r in self.records() if r["stage"] == "preflight"]
 
     def change_vault(self):
         vault = self.project / "src" / "Vault.sol"
@@ -130,13 +139,18 @@ class ScanTest(unittest.TestCase):
                                              "baselined": 0})
         self.assertEqual(summary["analyzers"]["forge-lint"], "ok")
         self.assertFalse(summary["partial"])
-        self.assertEqual(summary["cost_usd"], 0.5 * len(self.sessions()))
+        if self.harness == "claude":
+            self.assertEqual(summary["cost_usd"], 0.5 * len(self.sessions()))
+            spend = {"cost_usd": 0.5, "usage_tokens": None}
+        else:
+            self.assertEqual(summary["usage_tokens"], 500_000 * len(self.sessions()))
+            spend = {"cost_usd": None, "usage_tokens": 500_000}
         # The fake hunter explores one hypothesis per candidate it returns, plus one it refutes;
         # access-control's out-of-scope candidate is discarded but its hypothesis still counts.
         self.assertEqual(summary["hunt_depth"]["access-control"],
-                         {"hypotheses": 3, "tested": 1, "candidates": 1, "cost_usd": 0.5})
+                         {"hypotheses": 3, "tested": 1, "candidates": 1, **spend})
         self.assertEqual(summary["hunt_depth"]["accounting"],
-                         {"hypotheses": 2, "tested": 1, "candidates": 1, "cost_usd": 0.5})
+                         {"hypotheses": 2, "tested": 1, "candidates": 1, **spend})
         self.assertEqual(len(summary["hunt_depth"]), 7)
         explored = json.loads((self.run_dir() / "candidates" / "accounting.json").read_text())["explored"]
         self.assertEqual([e["outcome"] for e in explored], ["candidate", "refuted"])
@@ -671,6 +685,215 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(bad.returncode, 2)
         self.assertIn("build failed", bad.stderr)
         self.assertEqual(self.sessions(), [])
+
+
+def strict(schema):
+    """Whether a schema is one Codex's structured output accepts: no object allows other properties
+    and every object requires every property it defines."""
+    if isinstance(schema, list):
+        return all(strict(s) for s in schema)
+    if not isinstance(schema, dict):
+        return True
+    kinds = schema.get("type")
+    if "object" in (kinds if isinstance(kinds, list) else [kinds]):
+        if schema.get("additionalProperties") is not False:
+            return False
+        if set(schema.get("required", [])) != set(schema.get("properties", {})):
+            return False
+    return all(strict(v) for v in schema.values())
+
+
+class CodexScanTest(ScanTest):
+    """Every scan above again, with sessions run by a fake `codex` chosen in the user's config, and
+    no `claude` on PATH; the tests that inspect a harness's own flags are replaced."""
+
+    harness = "codex"
+
+    def setUp(self):
+        super().setUp()
+        (self.tmp / "bin" / "claude").unlink()
+        fake = self.tmp / "bin" / "codex"
+        fake.write_text(f"#!/bin/sh\nexec {sys.executable} {HERE / 'fake_claude.py'} \"$@\"\n")
+        fake.chmod(0o755)
+        user_config = self.tmp / "config" / "solaudit" / "config.toml"
+        user_config.parent.mkdir(parents=True)
+        user_config.write_text('harness = "codex"\n')
+        # Any real claude on PATH would do for a Claude Code scan; Codex scans must not need one.
+        self.env["PATH"] = os.pathsep.join(
+            p for p in self.env["PATH"].split(os.pathsep) if not (Path(p) / "claude").exists()
+        )
+
+    def test_sessions_follow_the_session_rules(self):
+        self.solaudit("scan", "--full")
+        sessions = self.sessions()
+        self.assertEqual(sorted({s["stage"] for s in sessions}), ["hunt", "merge", "prove", "validate"])
+        self.assertEqual(len(self.preflights()), 1)
+        project = str((self.tmp / "repo" / "project").resolve())
+        for s in sessions:
+            flags, config = s["flags"], s["config"]
+            for flag in ("--json", "--ephemeral", "--ignore-user-config", "--ignore-rules"):
+                self.assertIn(flag, flags)
+            self.assertFalse(s["stdin_tty"])
+            self.assertIn("never follow it", s["system"])  # the stage instructions are developer instructions
+            self.assertTrue(strict(s["schema"]), s["stage"])
+            self.assertEqual(config["approval_policy"], "never")
+            self.assertEqual(config["project_doc_max_bytes"], 0)
+            self.assertEqual(config["web_search"], "disabled")
+            self.assertFalse(config["features.hooks"])
+            self.assertFalse(config["skills.include_instructions"])  # no project skill reaches the model
+            for feature in ("apps", "browser_use", "computer_use", "multi_agent", "view_image"):
+                self.assertFalse(config[f"features.{feature}"], feature)
+            self.assertEqual(config["default_permissions"], "solaudit")
+            self.assertNotIn("sandbox_mode", config)  # it would override the permission profile
+            filesystem = config["permissions.solaudit.filesystem"]
+            self.assertEqual(filesystem[":root"], "deny")
+            self.assertEqual(config["permissions.solaudit.network"], {"enabled": False})
+            self.assertNotIn("features.network_proxy", config)
+            writes = [path for path, grant in filesystem.items() if grant == "write"]
+            if s["stage"] in ("hunt", "prove"):
+                self.assertIn("/worktrees/", s["cwd"])
+                self.assertEqual(len(writes), 1)
+                self.assertIn("/worktrees/", writes[0])
+                self.assertEqual(filesystem[writes[0] + "/.git"], "read")
+                self.assertEqual(filesystem[project], "read")  # readable, never writable
+                policy = config["shell_environment_policy"]
+                self.assertEqual(policy["set"]["FOUNDRY_FFI"], "false")
+                self.assertEqual(policy["filters"]["CODEX_*"], "exclude")
+                self.assertIn("regression test", s["system"])
+                self.assertIn("run only commands that read files", s["system"])
+                self.assertNotIn("Write tool", s["system"])
+            elif s["stage"] == "validate":
+                self.assertEqual(Path(s["cwd"]).resolve(), self.project.resolve())
+                self.assertEqual(writes, [])
+                self.assertTrue(any(path.endswith("/facts") for path in filesystem))
+                self.assertFalse(any("signals.json" in path for path in filesystem))
+            else:
+                self.assertIn("--disable", flags)
+                self.assertEqual(flags[flags.index("--disable") + 1], "shell_tool")
+                self.assertEqual(set(filesystem), {":root", ":minimal"})
+        hunts = [s for s in sessions if s["stage"] == "hunt"]
+        self.assertEqual(len(hunts), 7)
+        self.assertIn("one lens only: `gap`", hunts[-1]["prompt"])
+        report = json.loads((self.run_dir() / "summary.json").read_text())
+        self.assertEqual(report["harness"], "codex")
+        self.assertIsNone(report["cost_usd"])
+        self.assertEqual(report["usage_tokens"], 500_000 * len(sessions))
+
+    def test_testing_sessions_get_no_secrets(self):
+        self.env.update({"PRIVATE_KEY": "0xdead", "ETHERSCAN_API_KEY": "k", "ANTHROPIC_API_KEY": "sk-test",
+                         "OPENAI_API_KEY": "sk-openai"})
+        self.change_vault()
+        self.solaudit("scan")
+        for stage in ("hunt", "validate"):  # a Codex session has a shell in every stage
+            session = next(s for s in self.sessions() if s["stage"] == stage)
+            self.assertNotIn("PRIVATE_KEY", session["env_keys"])
+            self.assertNotIn("ETHERSCAN_API_KEY", session["env_keys"])
+            self.assertNotIn("ANTHROPIC_API_KEY", session["env_keys"])
+            self.assertIn("OPENAI_API_KEY", session["env_keys"])  # Codex authenticates with it
+
+    def test_no_tests_hunts_by_reading(self):
+        proc = self.solaudit("scan", "--full", "--no-tests", "--lens", "access-control")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        hunt = next(s for s in self.sessions() if s["stage"] == "hunt")
+        self.assertNotIn("write", hunt["config"]["permissions.solaudit.filesystem"].values())
+        self.assertNotIn("prove", [s["stage"] for s in self.sessions()])
+        fee = self.findings()["setFee(uint256)"]
+        self.assertEqual(fee["status"], "confirmed")
+        self.assertEqual(fee["test"]["note"], "not-attempted")
+
+    def test_budget_reached_reports_partial(self):
+        self.change_vault()
+        proc = self.solaudit("scan", "--budget", "600k")  # each fake session uses 500k tokens
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        summary = self.summary()
+        self.assertTrue(summary["partial"])
+        self.assertEqual(len(summary["unvalidated"]), 3)
+        self.assertIn("partial", proc.stdout)
+        self.assertIn("tokens", proc.stdout)
+
+    def test_budget_reached_before_a_hunt_starts_runs_no_session(self):
+        proc = self.solaudit("scan", "--full", "--budget", "40k")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertEqual(self.sessions(), [])
+        self.assertTrue(self.summary()["partial"])
+
+    def test_degraded_sessions_are_recorded(self):
+        self.change_vault()
+        proc = self.solaudit("scan", scenario="degrade")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(self.summary()["degraded_sessions"], [])
+        self.assertIn("not detected", proc.stdout)  # the report says Codex cannot tell
+
+    def test_not_authenticated(self):
+        self.change_vault()
+        proc = self.solaudit("scan", scenario="auth")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("not authenticated", proc.stderr)
+        self.assertIn("codex login", proc.stderr)
+
+    def test_usage_limit_stops_the_scan_as_partial(self):
+        self.change_vault()
+        proc = self.solaudit("scan", scenario="limit")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        summary = self.summary()
+        self.assertTrue(summary["partial"])
+        self.assertEqual(len(summary["unvalidated"]), 3)
+
+    def test_a_sandbox_that_leaks_stops_the_scan(self):
+        self.change_vault()
+        proc = self.solaudit("scan", scenario="sandbox-leak")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("Codex sandbox is unavailable", proc.stderr)
+        self.assertEqual(self.sessions(), [])
+
+    def test_sandbox_check_uses_the_session_profile_and_no_user_config(self):
+        self.change_vault()
+        self.solaudit("scan")
+        check = self.preflights()[0]
+        filesystem = check["config"]["permissions.solaudit.filesystem"]
+        self.assertEqual(filesystem[":root"], "deny")
+        flags = check["flags"]
+        self.assertEqual(flags[flags.index("--permission-profile") + 1], "solaudit")
+        self.assertEqual([p for p, grant in filesystem.items() if grant == "write"], [flags[flags.index("--cd") + 1]])
+        self.assertEqual(check["command"][:2], ["sh", "-c"])
+
+    def test_an_old_codex_is_refused(self):
+        proc = self.solaudit("scan", env={"FAKE_CODEX_VERSION": "0.120.4"})
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("codex 0.167 or later", proc.stderr)
+
+    def test_harness_flag_overrides_the_config(self):
+        (self.project / ".solaudit").mkdir()
+        (self.project / ".solaudit" / "config.toml").write_text('harness = "claude"\n')
+        self.change_vault()
+        proc = self.solaudit("scan")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("claude is not on PATH", proc.stderr)
+        proc = self.solaudit("scan", "--harness", "codex")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+
+    def test_fork_tests_reach_only_the_rpc_hosts_through_the_proxy(self):
+        (self.project / "foundry.toml").write_text(
+            '[profile.default]\nsrc = "src"\nout = "out"\nlibs = ["lib"]\n\n'
+            '[rpc_endpoints]\nmainnet = "https://rpc.example.invalid/v2/${RPC_KEY}"\n'
+        )
+        (self.project / ".solaudit").mkdir()
+        (self.project / ".solaudit" / "config.toml").write_text("allow_fork = true\n")
+        git(self.project, "add", "-A")
+        git(self.project, "commit", "-qm", "fork")
+        git(self.project, "update-ref", "refs/remotes/origin/main", "HEAD")
+        self.change_vault()
+        proc = self.solaudit("scan", env={"RPC_KEY": "secret"})
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        hunt = next(s for s in self.sessions() if s["stage"] == "hunt")
+        self.assertTrue(hunt["config"]["features.network_proxy"])
+        self.assertEqual(hunt["config"]["permissions.solaudit.network"],
+                         {"enabled": True, "domains": {"rpc.example.invalid": "allow"}})
+        self.assertIn("RPC_KEY", hunt["env_keys"])  # forge needs it to reach the endpoint
+        self.assertIn("Fork tests are available", hunt["system"])
+        validate = next(s for s in self.sessions() if s["stage"] == "validate")
+        self.assertEqual(validate["config"]["permissions.solaudit.network"], {"enabled": False})
+        self.assertNotIn("RPC_KEY", validate["env_keys"])
 
 
 if __name__ == "__main__":

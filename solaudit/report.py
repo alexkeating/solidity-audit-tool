@@ -75,20 +75,36 @@ def _footer_items(summary):
     if summary.get("hunt_depth"):
         items.append(("Hunt depth", [
             f"{lens}: {d['hypotheses']} hypotheses explored, {d['tested']} with a test, "
-            f"{d['candidates']} candidates, ${d['cost_usd']:.2f}"
+            f"{d['candidates']} candidates, {amount(d)}"
             for lens, d in summary["hunt_depth"].items()
         ]))
     if summary.get("unvalidated"):
         items.append(("Not validated before the cap was reached", [
             f"{u['fingerprint']} {u['contract']}.{u['function']}: {u['title']}" for u in summary["unvalidated"]
         ]))
-    if summary.get("degraded_sessions"):
+    if summary.get("harness") == "codex":
+        items.append(("Degraded sessions", [
+            "not detected: Codex reports neither the model that served a session nor safeguard stops",
+        ]))
+    elif summary.get("degraded_sessions"):
         items.append(("Degraded sessions", [
             f"{d['stage']}{' ' + d['subject'] if d['subject'] else ''}: configured {d['configured_model']}, "
             f"served by {', '.join(d['served_models']) or 'no model'}, safety stops {d['safety_stops']}"
             for d in summary["degraded_sessions"]
         ]))
     return items
+
+
+def amount(record):
+    """What a scan or a session spent, from its `cost_usd` or `usage_tokens`."""
+    if record.get("usage_tokens") is not None:
+        return f"{record['usage_tokens']:,} tokens"
+    return f"${record.get('cost_usd') or 0:.2f}"
+
+
+def spent(summary):
+    """What the scan spent, in its harness's unit."""
+    return ("Usage: " if summary.get("usage_tokens") is not None else "Cost: ") + amount(summary)
 
 
 def _counts_line(summary):
@@ -129,7 +145,7 @@ def render_text(findings, summary, show_rejected=False):
         lines.append(f"{heading}:")
         lines += [f"  - {item}" for item in items]
         lines.append("")
-    lines.append(f"Cost: ${summary.get('cost_usd', 0):.2f}" + (". The report is partial." if summary.get("partial") else "."))
+    lines.append(spent(summary) + (". The report is partial." if summary.get("partial") else "."))
     if summary.get("run"):
         lines.append(f"Run: {summary['run']}")
     return "\n".join(lines) + "\n"
@@ -178,7 +194,7 @@ def render_markdown(findings, summary, show_rejected=False):
             out += [f"**Test.** None ({test['note']}).", ""]
     for heading, items in _footer_items(summary):
         out += [f"## {heading}", "", *(f"- {item}" for item in items), ""]
-    out.append(f"Cost: ${summary.get('cost_usd', 0):.2f}." + (" **The report is partial.**" if summary.get("partial") else ""))
+    out.append(spent(summary) + "." + (" **The report is partial.**" if summary.get("partial") else ""))
     return "\n".join(out) + "\n"
 
 

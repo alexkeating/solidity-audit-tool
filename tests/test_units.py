@@ -6,11 +6,12 @@ import os
 import subprocess
 import tempfile
 import threading
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from solaudit import config, foundry, report, scope, sessions
+from solaudit import cli, codex, config, foundry, prompts, report, scope, sessions
 from solaudit.util import SolauditError, fingerprint
 
 
@@ -38,7 +39,12 @@ class ConfigTest(unittest.TestCase):
 
     def test_defaults(self):
         loaded = config.load_config(self.dir)
-        self.assertEqual(loaded["budget"], {"session_usd": 3.0, "quick_usd": 10.0, "deep_usd": 60.0})
+        self.assertEqual(loaded["budget"], {
+            "session_usd": 3.0, "quick_usd": 10.0, "deep_usd": 60.0,
+            "session_tokens": 5_000_000, "quick_tokens": 15_000_000, "deep_tokens": 100_000_000,
+        })
+        self.assertEqual(loaded["harness"], "claude")
+        self.assertEqual(loaded["model"], {"hunt": None, "validate": None, "prove": None})
         self.assertEqual(loaded["fail_on"], {"severity": "medium", "status": "confirmed"})
         self.assertEqual(loaded["parallel"], 4)
         self.assertEqual(len(loaded["lenses"]), 7)
@@ -435,6 +441,129 @@ def finding(status, severity, fp="f", lenses=("accounting",)):
     return {"fingerprint": fp, "status": status, "severity": severity, "title": "t", "category": "rounding",
             "contract": "Vault", "function": "f()", "locations": [{"file": "src/Vault.sol", "line": 3}],
             "lenses": list(lenses), "test": {"file": None, "note": "none-written"}, "validation": {}}
+
+
+class CodexTest(unittest.TestCase):
+    """The Codex harness's command line, permission profile, and reading of `codex exec --json`."""
+
+    def setUp(self):
+        # A slip in mocking finds no real codex; the secrets show what a session's environment drops.
+        guard = mock.patch.dict(os.environ, {"PATH": "", "PRIVATE_KEY": "0xdead", "CODEX_API_KEY": "k"})
+        guard.start()
+        self.addCleanup(guard.stop)
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def events(self, *events):
+        return "\n".join(json.dumps(e) for e in events) + "\n"
+
+    def success(self, output, usage=None):
+        return self.events(
+            {"type": "thread.started", "thread_id": "t"}, {"type": "turn.started"},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(output)}},
+            {"type": "turn.completed", "usage": usage or {"input_tokens": 1000, "cached_input_tokens": 600,
+                                                          "output_tokens": 50, "reasoning_output_tokens": 0}},
+        )
+
+    def run_with(self, stdout, stderr="", code=0, schema=None):
+        runner = sessions.Runner(self.tmp, sessions.Budget(1_000_000, 300_000, codex.MIN_SESSION_TOKENS),
+                                 codex.CodexHarness())
+        with mock.patch("solaudit.sessions.run_session_process", return_value=(stdout, stderr, code)) as run:
+            session = runner.run("validate", "abc", "prompt", "system", schema or {"type": "object"}, None, self.tmp,
+                                 access=sessions.Access("read", read=[self.tmp]))
+        return session, runner, run
+
+    def test_toml_values_round_trip(self):
+        for value in ["plain", 'quote " and \\ backslash', "line\nbreak\ttab \x7f \x01 é 😀", 7, True,
+                      {":root": "deny", "/a b/\"c\"": "read"}, {"enabled": True, "domains": {"x.io": "allow"}}]:
+            self.assertEqual(tomllib.loads(f"v = {codex.toml_value(value)}")["v"], value)
+
+    def test_strict_schema_closes_every_object(self):
+        strict = codex.strict_schema(prompts.candidate_schema(["accounting"]))
+        self.assertIs(strict["additionalProperties"], False)
+        item = strict["properties"]["candidates"]["items"]
+        self.assertIs(item["additionalProperties"], False)
+        self.assertIs(item["properties"]["test"]["additionalProperties"], False)  # a nullable object too
+        self.assertNotIn("additionalProperties", prompts.candidate_schema(["accounting"]))  # not changed in place
+
+    def test_success_counts_tokens(self):
+        session, runner, run = self.run_with(self.success({"x": 1}))
+        self.assertTrue(session.ok)
+        self.assertEqual(session.output, {"x": 1})
+        self.assertEqual(runner.budget.spent, 1050)
+        self.assertEqual(runner.degraded, [])
+        cmd = run.call_args.args[0]
+        self.assertEqual(cmd[:2], ["codex", "exec"])
+        self.assertEqual(cmd[-2:], ["--", "prompt"])
+        self.assertNotIn("--model", cmd)  # no model configured: Codex's own default
+        schema_file = Path(cmd[cmd.index("--output-schema") + 1])
+        self.assertIs(json.loads(schema_file.read_text())["additionalProperties"], False)
+        env = run.call_args.args[2]  # a reading session given no environment still drops secrets
+        self.assertNotIn("PRIVATE_KEY", env)
+        self.assertEqual(env["CODEX_API_KEY"], "k")
+
+    def test_schema_mismatch_and_missing_message(self):
+        session, _, _ = self.run_with(self.success({"x": 1}), schema={"type": "object", "required": ["y"]})
+        self.assertFalse(session.ok)
+        self.assertIn("schema", session.error)
+        session, runner, _ = self.run_with("", stderr="Error: boom", code=1)
+        self.assertFalse(session.ok)
+        self.assertIn("boom", session.error)
+        self.assertEqual(runner.budget.spent, 300_000)  # no usage reported: the whole cap counts
+
+    def test_auth_failure_is_read_from_codex_errors_only(self):
+        failed = "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header"
+        session, runner, _ = self.run_with(self.events(
+            {"type": "error", "message": f"Reconnecting... 1/5 ({failed})"},
+            {"type": "turn.failed", "error": {"message": failed}},
+        ), code=1)
+        self.assertTrue(session.auth_failed)
+        self.assertIs(runner.fatal, session)
+        session, _, _ = self.run_with(self.success({"x": "the API answers 401 Unauthorized to a replayed permit"}))
+        self.assertTrue(session.ok)
+        self.assertFalse(session.auth_failed)
+
+    def test_usage_limit_marks_the_scan_cap_reached(self):
+        session, runner, _ = self.run_with(self.events(
+            {"type": "turn.failed", "error": {"message": "You've hit your usage limit. Try again in 3 hours."}},
+        ), code=1)
+        self.assertFalse(session.ok)
+        self.assertTrue(session.hit_total_cap)
+        self.assertTrue(runner.budget.reached)
+        self.assertFalse(session.auth_failed)
+
+    def test_testing_profile_confines_reads_and_writes(self):
+        top = self.tmp / "wt"
+        root = top / "pkg"
+        (root / "lib").mkdir(parents=True)
+        project = self.tmp / "project"
+        project.mkdir()
+        access = sessions.Access("test", read=[project, root / "lib", self.tmp / "facts"], worktree=root,
+                                 writable=top, protected=[project], build_read=[project])
+        config = codex.sandbox_config(root, access)
+        filesystem = config[f"permissions.{codex.PROFILE}.filesystem"]
+        self.assertEqual(filesystem[":root"], "deny")
+        self.assertEqual(filesystem[str(top.resolve())], "write")
+        self.assertEqual(filesystem[str(top.resolve() / ".git")], "read")
+        self.assertEqual(filesystem[str(project.resolve())], "read")
+        # Paths inside the worktree get no read entry, which would take precedence over its write grant.
+        self.assertNotIn(str(root.resolve()), filesystem)
+        self.assertNotIn(str((root / "lib").resolve()), filesystem)
+        self.assertEqual(config[f"permissions.{codex.PROFILE}.network"], {"enabled": False})
+        self.assertNotIn("features.network_proxy", config)
+        hosts = sessions.Access("test", worktree=root, writable=top, fork_hosts=["rpc.example.com"])
+        config = codex.sandbox_config(root, hosts)
+        self.assertTrue(config["features.network_proxy"])
+        self.assertEqual(config[f"permissions.{codex.PROFILE}.network"]["domains"], {"rpc.example.com": "allow"})
+        reading = codex.sandbox_config(root, sessions.Access("read", read=[project], fork_hosts=["rpc.example.com"]))
+        self.assertEqual(reading[f"permissions.{codex.PROFILE}.network"], {"enabled": False})
+        self.assertNotIn("write", reading[f"permissions.{codex.PROFILE}.filesystem"].values())
+
+    def test_budget_amounts_take_suffixes(self):
+        self.assertEqual(cli._positive_amount("600k"), 600_000)
+        self.assertEqual(cli._positive_amount("1.5M"), 1_500_000)
+        self.assertEqual(cli._positive_amount("2.5"), 2.5)
+        with self.assertRaises(Exception):
+            cli._positive_amount("0k")
 
 
 class ReportTest(unittest.TestCase):

@@ -20,9 +20,9 @@ TEST_TIMEOUT = 900
 LINT_SEVERITIES = {"high": "high", "med": "medium", "low": "low"}
 
 
-def check_tools():
-    """Fail unless forge (1.8 or later), git, and claude are on PATH."""
-    for tool in ("forge", "git", "claude"):
+def check_tools(harness="claude"):
+    """Fail unless forge (1.8 or later), git, and the harness's program are on PATH."""
+    for tool in ("forge", "git", harness):
         if shutil.which(tool) is None:
             raise SolauditError(f"missing tool: {tool} is not on PATH")
     version = sh(["forge", "--version"], check=False).stdout

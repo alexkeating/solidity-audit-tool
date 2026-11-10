@@ -92,6 +92,33 @@ wrong assertion or an unrealistic setup); the tool re-runs every test with FFI o
 are off unless the project allows network to its RPC endpoints. Hunters now cost more, so the $3
 per-session and $10/$60 scan caps are more likely to bind than before.
 
+## Codex as a second harness (draft 5)
+
+For developers with a Codex (ChatGPT) plan and no Claude subscription. Decided with the operator:
+Codex sessions get the same read, write, and network limits as Claude Code sessions; Codex budgets
+count tokens; `claude` stays the default and a user config can choose `codex`; fork tests work
+under Codex.
+
+Checked against Codex 0.167 on Linux:
+- `codex exec --json` prints JSONL. Usage is only in `turn.completed` and is tokens, with no
+  cost, served model, or safeguard count, so per-session caps cannot be enforced mid-session and
+  degradation cannot be detected. Auth failure is `turn.failed` with "401 Unauthorized", exit 1.
+- Claude Code limits commands with tool rules; Codex has none that help. Its exec-policy `allow`
+  runs a command *outside* the sandbox, so an allowlist would weaken it. The limits therefore come
+  from a permission profile: `":root" = "deny"`, `":minimal" = "read"`, then explicit grants. A
+  sandboxed `cat ~/.ssh/...` sees no such file; a write outside the grants lands on a throwaway
+  layer, not the disk. forge needs read access to its solc store (`~/.local/share/svm` here).
+- `features.network_proxy = true` with `network.domains = {host = "allow"}` lets `cast` reach the
+  allowed RPC host and refuses others with a 403; `curl --noproxy '*'` resolves nothing.
+- A hostile fixture with `AGENTS.md`, a project `.codex/config.toml` asking for
+  `danger-full-access`, and a project skill: with `--ignore-user-config` and
+  `project_doc_max_bytes = 0` neither the file nor the config reached the session, but the skill
+  did, and the model followed it, until `skills.include_instructions = false`. Checked by pointing
+  Codex at a local stand-in for the Responses API and reading the request it sent.
+- The default tool list includes sub-agents, goals, and `view_image`, which reads files from the
+  Codex process itself rather than the sandbox; all are turned off, leaving the shell.
+- `codex sandbox` needs `--permission-profile` when no user config is loaded.
+
 ## Not verified
 
 - `forge properties` / `forge exploit` behavior (needs Foundry 1.9).
@@ -100,6 +127,9 @@ per-session and $10/$60 scan caps are more likely to bind than before.
 - All vendor benchmark numbers.
 - That symlinked `libs` directories plus copied `out`/`cache` give a working incremental build in
   a git worktree, and that `forge` runs inside the Claude Code sandbox with network denied.
+- The exact text Codex writes when a ChatGPT plan's usage limit stops a session; the tool matches
+  "usage limit" and similar phrases.
+- Codex on macOS, whose sandbox is Seatbelt rather than bubblewrap and Landlock.
 
 ## Sources
 

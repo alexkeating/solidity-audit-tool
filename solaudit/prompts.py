@@ -217,14 +217,13 @@ hypothesis:
 - fork: a test that forks a network by naming an entry of `[rpc_endpoints]` in foundry.toml, when
   the flaw depends on how the system meets the deployed contracts it integrates with.{fork}
 
-Write each test file under `{test_dir}` inside the project directory you are working in, using
-the Write tool. Keep each file self-contained: put any handler, stand-in, or helper the test needs
+Write each test file under `{test_dir}` inside the project directory you are working in{write_with}.
+Keep each file self-contained: put any handler, stand-in, or helper the test needs
 in the same file. Import project sources by their path from the project root (for example
 `import {{Vault}} from "src/Vault.sol";`) and forge-std as `forge-std/Test.sol`.
 
 Run a test with exactly one command of the form `forge test --match-path <file>` (add
-`--match-test <name>` or `-vvv` as needed), or build with `forge build`. Run no other command and
-do not chain commands. Shell commands run in a sandbox with no network{network}, and FFI is off.
+`--match-test <name>` or `-vvv` as needed), or build with `forge build`. {other_commands} Shell commands run in a sandbox with no network{network}, and FFI is off.
 Read the result: a test that fails because of the defect is evidence; a test that fails because of
 its own setup, a wrong assertion, or a compile error is not, so fix it or abandon the hypothesis. A
 test that passes refutes the hypothesis as tested; refine it or move on."""
@@ -259,7 +258,7 @@ DEPTH = """\
 Depth. Work through the lens systematically rather than sampling it. Start from the entry points
 in the facts: list every one the lens bears on, form hypotheses against each, and {settle} them
 one by one. Keep going until every such entry point has been covered or your
-spending cap of ${cap:.2f} is nearly spent; a hunt that ends with most of its cap unspent has
+spending cap of {cap} is nearly spent; a hunt that ends with most of its cap unspent has
 almost always stopped too soon. Audits, formal verification, wide use, a clean set of signals, and your own
 familiarity with the project are not evidence that this code is sound: judge it only by what
 your own {evidence} show. An empty list of candidates is a correct answer only after that work,
@@ -271,16 +270,26 @@ intended behavior. Trust assumptions bound what counts as an attacker: an actor 
 to do something is not an attacker for doing it."""
 
 
-def probing(test_dir, fork_hosts):
+def probing(test_dir, fork_hosts, harness="claude"):
     fork = (
         "\nFork tests are available: forked calls may reach the configured RPC endpoints."
         if fork_hosts else "\nFork tests are not available in this scan: write none."
     )
     network = " except to the configured RPC endpoints" if fork_hosts else ""
-    return PROBING.format(fork=fork, test_dir=test_dir, network=network)
+    if harness == "codex":
+        # A Codex session reads files and writes tests through its shell.
+        write_with = ""
+        other = (f"Apart from these, run only commands that read files, such as `cat`, `sed -n`, `rg`, and "
+                 f"`ls`, and write no file outside `{test_dir}`.")
+    else:
+        write_with, other = ", using the Write tool", "Run no other command and do not chain commands."
+    return PROBING.format(fork=fork, test_dir=test_dir, network=network, write_with=write_with,
+                          other_commands=other)
 
 
-def hunt_system(tag, lenses, test_dir, fork_hosts, testing, cap):
+def hunt_system(tag, lenses, test_dir, fork_hosts, testing, cap, harness="claude"):
+    """The Hunt stage's instructions; `cap` is the session's cap as written for the hunter, such as
+    `$3.00` or `5,000,000 tokens`."""
     parts = [ROLE.format(stage="hunt"), data_rule(tag), TRUST]
     if testing:
         parts += [
@@ -288,7 +297,7 @@ def hunt_system(tag, lenses, test_dir, fork_hosts, testing, cap):
             "fits it, write a test that asserts the behavior the project intends, run it, and refine "
             "or abandon the hypothesis according to the result.",
             DEPTH.format(settle="probe", cap=cap, evidence="reading and probes"),
-            probing(test_dir, fork_hosts),
+            probing(test_dir, fork_hosts, harness),
             REALISM,
         ]
     else:
@@ -375,6 +384,6 @@ def merge_system(tag):
     return "\n\n".join([ROLE.format(stage="merge"), data_rule(tag), MERGE_SYSTEM])
 
 
-def prove_system(tag, test_dir, fork_hosts):
+def prove_system(tag, test_dir, fork_hosts, harness="claude"):
     return "\n\n".join([ROLE.format(stage="prove"), data_rule(tag), TRUST, PROVE_SYSTEM,
-                        probing(test_dir, fork_hosts), REALISM])
+                        probing(test_dir, fork_hosts, harness), REALISM])

@@ -11,7 +11,7 @@ from pathlib import Path
 
 from . import baseline as baseline_mod
 from . import foundry, report
-from .config import load_config
+from .config import HARNESSES, load_config
 from .lenses import LENS_NAMES
 from .util import (
     EXIT_ERROR, EXIT_OK, SolauditError, read_json, runs_home, stop_all, stopping, write_text,
@@ -34,7 +34,9 @@ def parser():
     scan.add_argument("--profile", choices=["quick", "deep"])
     scan.add_argument("--lens", action="append", choices=LENS_NAMES, dest="lenses",
                       help="restrict the deep profile to this lens (repeatable)")
-    scan.add_argument("--budget", type=_positive_usd, metavar="USD", help="total spending cap for the scan")
+    scan.add_argument("--harness", choices=HARNESSES, help="run sessions under Claude Code or Codex")
+    scan.add_argument("--budget", type=_positive_amount, metavar="AMOUNT",
+                      help="total cap for the scan: USD under Claude Code, tokens under Codex (k and M suffixes)")
     scan.add_argument("--no-tests", action="store_true", help="hunt by reading only; no test is written")
     scan.add_argument("--format", choices=FORMATS, default="text")
     scan.add_argument("--out", metavar="PATH", help="write the report here instead of stdout")
@@ -65,9 +67,11 @@ def parser():
     return top
 
 
-def _positive_usd(text):
+def _positive_amount(text):
+    """A positive number, optionally with a `k` (thousand) or `M` (million) suffix."""
+    scale = {"k": 1_000, "K": 1_000, "m": 1_000_000, "M": 1_000_000}.get(text[-1:], 1)
     try:
-        value = float(text)
+        value = float(text[:-1] if scale != 1 else text) * scale
     except ValueError:
         raise argparse.ArgumentTypeError(f"not a number: {text}")
     if value <= 0:
@@ -116,6 +120,7 @@ def main(argv=None):
 
 
 def cmd_scan(args):
+    from .harness import check_harness
     from .pipeline import Project, Scan
 
     if isinstance(args.diff, str) and args.project_root == "." and (Path(args.diff) / "foundry.toml").is_file():
@@ -124,8 +129,10 @@ def cmd_scan(args):
     root = Path(args.project_root).resolve()
     if not (root / "foundry.toml").is_file():
         raise SolauditError(f"not a Foundry project: {root} has no foundry.toml")
-    foundry.check_tools()
     config = load_config(root)
+    harness = args.harness or config["harness"]
+    foundry.check_tools(harness)
+    check_harness(harness)
     project = Project(root)
     options = {
         "mode": "full" if args.full else "diff",
@@ -133,6 +140,7 @@ def cmd_scan(args):
         "profile": args.profile,
         "lenses": args.lenses,
         "budget": args.budget,
+        "harness": harness,
         "no_tests": args.no_tests,
         "format": args.format,
         "show_rejected": args.show_rejected,

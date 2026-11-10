@@ -1,0 +1,17 @@
+[project]
+name = "solaudit"
+version = "0.1.0"
+description = "Find security vulnerabilities in a Foundry project's Solidity source"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = []
+
+[project.scripts]
+solaudit = "solaudit.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["solaudit"]

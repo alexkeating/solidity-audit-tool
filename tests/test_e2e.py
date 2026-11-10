@@ -131,6 +131,20 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(summary["analyzers"]["forge-lint"], "ok")
         self.assertFalse(summary["partial"])
         self.assertEqual(summary["cost_usd"], 0.5 * len(self.sessions()))
+        # The fake hunter explores one hypothesis per candidate it returns, plus one it refutes;
+        # access-control's out-of-scope candidate is discarded but its hypothesis still counts.
+        self.assertEqual(summary["hunt_depth"]["access-control"],
+                         {"hypotheses": 3, "tested": 1, "candidates": 1, "cost_usd": 0.5})
+        self.assertEqual(summary["hunt_depth"]["accounting"],
+                         {"hypotheses": 2, "tested": 1, "candidates": 1, "cost_usd": 0.5})
+        self.assertEqual(len(summary["hunt_depth"]), 7)
+        explored = json.loads((self.run_dir() / "candidates" / "accounting.json").read_text())["explored"]
+        self.assertEqual([e["outcome"] for e in explored], ["candidate", "refuted"])
+        self.assertEqual(explored[0]["test"], "test/solaudit/accounting/Deposit.t.sol")
+        # An entry point another hunter explored is not handed to the gap hunter as undiscussed.
+        gap = [s for s in self.sessions() if s["stage"] == "hunt" and "one lens only: `gap`" in s["prompt"]][0]
+        self.assertNotIn("Vault.sweep(address)", gap["prompt"])
+        self.assertIn("Token.mint(uint256)", gap["prompt"])
 
         report = json.loads(proc.stdout)
         self.assertEqual([f["status"] for f in report["findings"]], ["proven", "proven"])  # rejected hidden

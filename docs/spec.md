@@ -315,6 +315,26 @@ All records are JSON objects. Field order is not significant.
   `kind` is `unit`, `fuzz`, `invariant`, or `fork`; `file` is its path in the hunter's worktree;
   `name` is the test function's signature; `property` states in words what the test asserts.
 
+**Explored hypothesis** — one entry of the record a hunter returns, beside its candidates, of
+every hypothesis it investigated.
+
+```json
+{
+  "hypothesis": "A withdrawal can round the caller's shares down to zero while paying out assets",
+  "contract": "Vault",
+  "function": "withdraw(uint256,address)",
+  "test": "test/solaudit/accounting/WithdrawRounding.t.sol",
+  "outcome": "refuted"
+}
+```
+
+- `hypothesis` — one sentence.
+- `contract`, `function` — as for a candidate; the function is canonicalized the same way.
+- `test` — the project-relative path of the test the hunter ran for it, or the empty string when
+  it settled the hypothesis by reading alone; always empty under `--no-tests`.
+- `outcome` — `candidate` when it is among the hunter's candidates, `refuted` when a test or the
+  code showed it false, `abandoned` when the hunter could not settle it.
+
 **Finding** — a merged candidate after validation, as written to the report.
 
 ```json
@@ -407,6 +427,9 @@ Two candidates with the same fingerprint are the same finding.
   "analyzers": {"forge-lint": "ok", "slither": "absent"},
   "counts": {"proven": 0, "confirmed": 1, "uncertain": 1, "rejected": 6, "baselined": 2},
   "stale_baseline": [],
+  "hunt_depth": {
+    "accounting": {"hypotheses": 9, "tested": 6, "candidates": 1, "cost_usd": 2.41}
+  },
   "degraded_sessions": [
     {
       "stage": "prove",
@@ -419,6 +442,9 @@ Two candidates with the same fingerprint are the same finding.
 }
 ```
 
+- `hunt_depth` — one entry per Hunt session that completed, keyed by its lens (`all` under the
+  quick profile): the number of hypotheses in its explored record, how many of those name a test,
+  how many of its candidates were kept, and what the session cost.
 - `degraded_sessions` — one entry per session that was served by any model other than the one
   configured for its stage, or whose `safety_stops` is greater than zero. `stage` is `hunt`,
   `merge`, `validate`, or `prove`; `subject` is the lens name for a Hunt session, the finding's
@@ -494,14 +520,21 @@ Stage behavior:
    in scope. Deduplicates identical tool, rule, file, and line.
 4. **Hunt.** Quick profile: one session carrying all lens briefs. Deep profile: one session per
    configured lens other than the gap lens, at most `parallel` at a time, then the gap session,
-   which additionally receives every candidate so far and the list of entry points no candidate
-   mentions. Each session runs in its own testing worktree (see Testing Worktrees) with the
-   testing tool set. It is instructed to search by reading and by probing: for each hypothesis,
-   to choose the kind of test that fits it, write the test under `test/solaudit/<lens>/` so that
-   it asserts the intended behavior under the production-realism rules, run it, and refine or
-   abandon the hypothesis according to the result. Its output conforms to a schema whose result
-   is an array of candidates; a candidate carries a `test` only when that test failed in the
-   session's own run. A candidate whose `contract` is not in scope is discarded. A session that
+   which additionally receives every candidate so far and the list of entry points that no
+   candidate mentions and no earlier hunter explored. Each session runs in its own testing
+   worktree (see Testing Worktrees) with the testing tool set. It is instructed to search by
+   reading and by probing: for each hypothesis, to choose the kind of test that fits it, write
+   the test under `test/solaudit/<lens>/` so that it asserts the intended behavior under the
+   production-realism rules, run it, and refine or abandon the hypothesis according to the
+   result. It is told its per-session cap and instructed to work through every in-scope entry
+   point its lens bears on until each is covered or the cap is nearly spent, and not to treat
+   audits, formal verification, wide use, clean signals, or its own familiarity with the project
+   as evidence that the code is sound. Its output conforms to a schema whose result is an array
+   of candidates and an explored record of every hypothesis it investigated (see Explored
+   hypothesis); a candidate carries a `test` only when that test failed in the session's own
+   run. A candidate whose `contract` is not in scope is discarded; its explored entry is kept.
+   `candidates/<lens>.json` holds both, and the report's hunt depth is counted from the explored
+   record. A session that
    errors or exceeds its cap contributes no candidates, and the report names the lens as
    incomplete. When each session ends, the tool checks every candidate's test (see Test Check).
 5. **Merge.** Candidates with equal fingerprints are merged mechanically: the earliest title,
@@ -533,7 +566,8 @@ Report contents, in every format: findings ordered by status (`proven`, `confirm
 `uncertain`), then severity; for each, title, severity, status, location, scenario, impact,
 recommendation, the validation reasoning, and, when it has a test, the test's kind, the property
 it asserts, its failure reason and counterexample, and its path. Then: stale baseline entries,
-analyzers that did not run, lenses that did not complete, degraded sessions with the model
+analyzers that did not run, lenses that did not complete, the hunt depth of each lens that did
+(hypotheses explored, how many with a test, candidates kept, cost), degraded sessions with the model
 configured and the models that served each, total cost, and whether the report is partial. A
 finding whose Hunt, Validate, or Prove session was degraded is marked as such next to its
 status. Rejected findings appear only with `--show-rejected`. In SARIF, each finding is one

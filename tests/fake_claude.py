@@ -226,7 +226,15 @@ def hunt():
         assert data("undiscussed entry points") is not None, "the gap hunter needs the undiscussed entry points"
         assert data("other candidates") is not None, "the gap hunter needs the other candidates"
         out.append(candidate("gap", "setFee has no access control", "access-control", "setFee(uint256)", 24))
-    finish({"candidates": out})
+    assert re.search(r"spending cap of \$\d+\.\d\d", SYSTEM), "the hunter is told its spending cap"
+    explored = [
+        {"hypothesis": c["title"], "contract": c["contract"], "function": c["function"],
+         "test": (c["test"] or {}).get("file", ""), "outcome": "candidate"}
+        for c in out
+    ]
+    explored.append({"hypothesis": "sweep can send the vault's funds to an address the owner did not choose",
+                     "contract": "Vault", "function": "sweep(address)", "test": "", "outcome": "refuted"})
+    finish({"candidates": out, "explored": explored})
 
 
 def merge():

@@ -195,6 +195,8 @@ class Scan:
         self.worktree_lock = threading.Lock()
         self._warned_unconfined = False
         self.incomplete = []
+        self.depth = {}  # lens → how much its Hunt session explored
+        self.depth_lock = threading.Lock()
         self.analyzers = {}
         self.base = None
         self.run_id = self.run_dir = self.runner = None
@@ -283,6 +285,7 @@ class Scan:
             "stale_baseline": stale,
             "degraded_sessions": self.runner.degraded if self.runner else [],
             "incomplete_lenses": self.incomplete,
+            "hunt_depth": self.depth,
             "unvalidated": [
                 {k: f[k] for k in ("fingerprint", "title", "contract", "function", "category")} for f in unvalidated
             ],
@@ -446,8 +449,9 @@ class Scan:
             sessions += list(pool.map(lambda plan: self.hunt_session(*plan, known), regular))
         self.check_fatal()
         candidates = [c for s in sessions for c in s["candidates"]]
+        explored = [e for s in sessions for e in s["explored"]]
         if gap:
-            sessions.append(self.hunt_session(*gap, known, prior=candidates))
+            sessions.append(self.hunt_session(*gap, known, prior=candidates, prior_explored=explored))
             self.check_fatal()
             candidates += sessions[-1]["candidates"]
         started = [s for s in sessions if not s["session"].not_started]
@@ -472,9 +476,10 @@ class Scan:
                     "not authenticated: log in to Claude Code (run `claude` and use /login) or set ANTHROPIC_API_KEY"
                 )
 
-    def entry_points_not_mentioned(self, prior):
+    def entry_points_not_mentioned(self, prior, prior_explored=()):
+        """Entry points no earlier candidate is about and no earlier hunter explored."""
         mentioned = set()
-        for c in prior:
+        for c in [*prior, *prior_explored]:
             mentioned.add((c["contract"], c["function"]))
         missing = []
         for contract in self.facts:
@@ -483,7 +488,7 @@ class Scan:
                     missing.append(f"{contract['contract']}.{e['signature']} — {e['file']}:{e['line']}")
         return missing
 
-    def hunt_session(self, name, lens_names, known, prior=None):
+    def hunt_session(self, name, lens_names, known, prior=None, prior_explored=()):
         prompt = prompts.Prompt()
         probes = self.project.probe_dir
         test_dir = f"{probes}/{name}/" if name != "all" else f"{probes}/<lens>/ (the lens the hypothesis falls under)"
@@ -513,9 +518,11 @@ class Scan:
             prompt.data("other candidates", prompts.shrink("\n".join(
                 f"[{c['lens']}] {c['contract']}.{c['function']} ({c['category']}): {c['title']}" for c in prior
             ) or "(none)", CANDIDATES_LIMIT, "the list is longer"))
-            prompt.text("Entry points none of those candidates is about:")
-            prompt.data("undiscussed entry points", "\n".join(self.entry_points_not_mentioned(prior)) or "(none)")
-        system = prompts.hunt_system(prompt.tag, lens_names, test_dir, self.fork_hosts, self.testing)
+            prompt.text("Entry points none of those candidates is about and no other hunter explored:")
+            prompt.data("undiscussed entry points",
+                        "\n".join(self.entry_points_not_mentioned(prior, prior_explored)) or "(none)")
+        system = prompts.hunt_system(prompt.tag, lens_names, test_dir, self.fork_hosts, self.testing,
+                                     self.budget.per_session)
         schema = prompts.candidate_schema(lens_names)
         worktree, problem = None, None
         if self.testing and not (self.budget.reached or stopping() or self.runner.fatal):
@@ -537,18 +544,29 @@ class Scan:
                 "hunt", name, prompt.render(), system, schema, self.config["model"]["hunt"], worktree.root,
                 **self.testing_session(worktree),
             )
-        result = {"session": session, "candidates": []}
+        result = {"session": session, "candidates": [], "explored": []}
         if not session.ok:
             if worktree:
                 self.drop_worktree(worktree)
             self.incomplete += lens_names if name != "all" else ["all lenses (quick profile)"]
-            write_json(self.run_dir / "candidates" / f"{name}.json", {"error": session.error, "candidates": []})
+            write_json(self.run_dir / "candidates" / f"{name}.json",
+                       {"error": session.error, "candidates": [], "explored": []})
             return result
         candidates = []
         for raw in session.output["candidates"]:
             candidate = self.normalize_candidate(raw, name, worktree.root if worktree else None)
             if candidate:
                 candidates.append(candidate)
+        explored = [self.normalize_explored(raw, worktree.root if worktree else None)
+                    for raw in session.output["explored"]]
+        result["explored"] = explored
+        with self.depth_lock:
+            self.depth[name] = {
+                "hypotheses": len(explored),
+                "tested": sum(1 for e in explored if e["test"]),
+                "candidates": len(candidates),
+                "cost_usd": round(session.cost, 4),
+            }
         if worktree and any(c["test"] for c in candidates):
             spoiled = self.prepare_check(worktree)
             cache = {}
@@ -557,7 +575,8 @@ class Scan:
                     candidate["check"] = self.check_test(worktree, candidate["test"], spoiled, cache)
         if worktree:
             self.drop_worktree(worktree)
-        write_json(self.run_dir / "candidates" / f"{name}.json", {"error": None, "candidates": public(candidates)})
+        write_json(self.run_dir / "candidates" / f"{name}.json",
+                   {"error": None, "candidates": public(candidates), "explored": explored})
         result["candidates"] = candidates
         return result
 
@@ -599,6 +618,17 @@ class Scan:
             candidate["test"] = None
         candidate["check"] = None
         return candidate
+
+    def normalize_explored(self, raw, worktree_root=None):
+        """One entry of a hunter's `explored` record, in the same terms as a candidate."""
+        entry = {key: raw[key] for key in prompts.EXPLORED_SCHEMA["properties"]}
+        entry["contract"] = entry["contract"].strip().rsplit(":", 1)[-1].strip()
+        entry["function"] = canonical_signature(entry["function"], self.signatures.get(entry["contract"], ()))
+        if not self.testing:
+            entry["test"] = ""
+        elif entry["test"]:
+            entry["test"] = self.project_path(entry["test"], worktree_root)
+        return entry
 
     # ── Test Check ──────────────────────────────────────────────────────────
 

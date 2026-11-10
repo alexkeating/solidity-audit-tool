@@ -63,9 +63,27 @@ def candidate_schema(lenses):
     }
     return {
         "type": "object",
-        "properties": {"candidates": {"type": "array", "items": candidate}},
-        "required": ["candidates"],
+        "properties": {
+            "candidates": {"type": "array", "items": candidate},
+            "explored": {"type": "array", "items": EXPLORED_SCHEMA},
+        },
+        "required": ["candidates", "explored"],
     }
+
+
+OUTCOMES = ["candidate", "refuted", "abandoned"]
+
+EXPLORED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "hypothesis": {"type": "string"},
+        "contract": {"type": "string"},
+        "function": {"type": "string"},
+        "test": {"type": "string"},
+        "outcome": {"type": "string", "enum": OUTCOMES},
+    },
+    "required": ["hypothesis", "contract", "function", "test", "outcome"],
+}
 
 
 MERGE_SCHEMA = {
@@ -229,7 +247,23 @@ run for the reason the candidate claims; solaudit runs it again itself. For each
 - `test`: `kind`, `file` (relative to the project root), `name` (the test function's signature,
   such as `testFuzz_X(uint256)`), and `property` (what the test asserts, in words).
 Report flaws, not style concerns, gas optimizations, or missing events with no consequence. Do not
-report again a finding listed as already triaged. Report only contracts in scope."""
+report again a finding listed as already triaged. Report only contracts in scope.
+
+Also return `explored`: every hypothesis you investigated, whether or not it became a candidate.
+For each: `hypothesis`, one sentence; `contract` and `function`, as for a candidate; `test`, the
+file of the test you ran for it, or "" when you settled it by reading alone; and `outcome`:
+`candidate` when it is among your candidates, `refuted` when a test or the code showed it false,
+`abandoned` when you could not settle it."""
+
+DEPTH = """\
+Depth. Work through the lens systematically rather than sampling it. Start from the entry points
+in the facts: list every one the lens bears on, form hypotheses against each, and {settle} them
+one by one. Keep going until every such entry point has been covered or your
+spending cap of ${cap:.2f} is nearly spent; a hunt that ends with most of its cap unspent has
+almost always stopped too soon. Audits, formal verification, wide use, a clean set of signals, and your own
+familiarity with the project are not evidence that this code is sound: judge it only by what
+your own {evidence} show. An empty list of candidates is a correct answer only after that work,
+and `explored` is the record of it."""
 
 TRUST = """\
 The project's security context, when given, states its invariants, its trust assumptions, and its
@@ -246,21 +280,23 @@ def probing(test_dir, fork_hosts):
     return PROBING.format(fork=fork, test_dir=test_dir, network=network)
 
 
-def hunt_system(tag, lenses, test_dir, fork_hosts, testing):
+def hunt_system(tag, lenses, test_dir, fork_hosts, testing, cap):
     parts = [ROLE.format(stage="hunt"), data_rule(tag), TRUST]
     if testing:
         parts += [
             "Search by reading and by probing. For each hypothesis, choose the kind of test that "
             "fits it, write a test that asserts the behavior the project intends, run it, and refine "
             "or abandon the hypothesis according to the result.",
+            DEPTH.format(settle="probe", cap=cap, evidence="reading and probes"),
             probing(test_dir, fork_hosts),
             REALISM,
         ]
     else:
-        parts.append(
+        parts += [
             "Search by reading the code. You cannot write or run tests in this scan, so set `test` "
-            "to null on every candidate."
-        )
+            "to null on every candidate, and to \"\" on every entry of `explored`.",
+            DEPTH.format(settle="trace", cap=cap, evidence="reading and tracing"),
+        ]
     parts.append(HUNT_OUTPUT)
     if len(lenses) > 1:
         parts.append(

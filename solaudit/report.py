@@ -72,6 +72,12 @@ def _footer_items(summary):
         items.append(("Analyzers that did not run", missing))
     if summary.get("incomplete_lenses"):
         items.append(("Lenses that did not complete", list(summary["incomplete_lenses"])))
+    if summary.get("hunt_depth"):
+        items.append(("Hunt depth", [
+            f"{lens}: {d['hypotheses']} hypotheses explored, {d['tested']} with a test, "
+            f"{d['candidates']} candidates, ${d['cost_usd']:.2f}"
+            for lens, d in summary["hunt_depth"].items()
+        ]))
     if summary.get("unvalidated"):
         items.append(("Not validated before the cap was reached", [
             f"{u['fingerprint']} {u['contract']}.{u['function']}: {u['title']}" for u in summary["unvalidated"]

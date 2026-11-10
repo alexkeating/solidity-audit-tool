@@ -496,6 +496,13 @@ class ReportTest(unittest.TestCase):
         self.assertIn("oracle", text)
         self.assertIn("partial", text)
 
+    def test_reports_list_hunt_depth(self):
+        summary = {"mode": "full", "profile": "deep", "counts": {}, "cost_usd": 1.5,
+                   "hunt_depth": {"accounting": {"hypotheses": 9, "tested": 6, "candidates": 1, "cost_usd": 2.4}}}
+        line = "accounting: 9 hypotheses explored, 6 with a test, 1 candidates, $2.40"
+        self.assertIn(line, report.render_text([], summary))
+        self.assertIn(line, report.render_markdown([], summary))
+
 
 if __name__ == "__main__":
     unittest.main()
